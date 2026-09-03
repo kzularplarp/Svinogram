@@ -18,9 +18,6 @@ def run(cmd, **kwargs):
     subprocess.run([str(x) for x in cmd], check=True, **kwargs)
 
 def patch_rules_apple_for_unsigned_device():
-    # Telegram's --disableProvisioningProfiles flag is intended for simulator
-    # builds. We want a real iphoneos arm64 binary but no final signature,
-    # because Feather will sign the IPA later.
     path = (
         ROOT
         / "build-system"
@@ -40,27 +37,27 @@ def patch_rules_apple_for_unsigned_device():
         print("rules_apple unsigned-device patch already applied")
         return
 
-    old = '''    if not profile_artifact:
+    old = """    if not profile_artifact:
         fail(
-            "\\n".join([
+            "\n".join([
                 "ERROR: In {}:".format(str(rule_label)),
                 "Building for device, but no provisioning_profile attribute was set.",
             ]),
         )
-'''
+"""
 
-    new = '''    # SVINOGRAM_UNSIGNED_DEVICE_PATCH
+    new = """    # SVINOGRAM_UNSIGNED_DEVICE_PATCH
     # This CI job creates an unsigned device IPA. Feather signs it afterwards.
     if not profile_artifact:
         return struct(
             bundle_files = [],
         )
-'''
+"""
 
     if old in text:
         text = text.replace(old, new, 1)
     else:
-        marker = 'Building for device, but no provisioning_profile attribute was set.'
+        marker = "Building for device, but no provisioning_profile attribute was set."
         if marker not in text:
             raise SystemExit(
                 "Could not locate the rules_apple device provisioning guard; "
@@ -87,11 +84,11 @@ def make_configuration_repo(bazel_path: Path) -> Path:
 
     (repo / "WORKSPACE").write_text("", encoding="utf-8")
     (repo / "MODULE.bazel").write_text(
-        'module(\\n    name = "build_configuration",\\n)\\n',
+        'module(\n    name = "build_configuration",\n)\n',
         encoding="utf-8",
     )
     (repo / "BUILD").write_text("", encoding="utf-8")
-    (provisioning / "BUILD").write_text("exports_files([])\\n", encoding="utf-8")
+    (provisioning / "BUILD").write_text("exports_files([])\n", encoding="utf-8")
 
     lines = [
         f'telegram_bazel_path = "{bazel_path}"',
@@ -112,7 +109,7 @@ def make_configuration_repo(bazel_path: Path) -> Path:
         'telegram_enable_watch = True',
         '',
     ]
-    (repo / "variables.bzl").write_text("\\n".join(lines), encoding="utf-8")
+    (repo / "variables.bzl").write_text("\n".join(lines), encoding="utf-8")
     return repo
 
 def main():
