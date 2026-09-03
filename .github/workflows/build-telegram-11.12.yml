@@ -1,4 +1,4 @@
-name: Build Svinogram 11.12 injected
+name: Build Svinogram 11.12 injected v8
 
 on:
   workflow_dispatch:
@@ -60,7 +60,6 @@ jobs:
           set -euxo pipefail
           git clone --depth 1 https://github.com/Tyilo/insert_dylib.git
           cc insert_dylib/insert_dylib/main.c -o insert_dylib_bin
-          ./insert_dylib_bin --help >/dev/null 2>&1 || true
 
       - name: Download SideloadFix
         env:
@@ -76,7 +75,7 @@ jobs:
           test -f sideloadfix/SideloadFix.dylib
           shasum -a 256 sideloadfix/SideloadFix.dylib
 
-      - name: Inject Svinogram tweak
+      - name: Inject Svinogram correctly
         shell: bash
         run: |
           set -euxo pipefail
@@ -86,27 +85,18 @@ jobs:
           INSERT="$GITHUB_WORKSPACE/insert_dylib_bin"
           SIDELOAD_FIX="$GITHUB_WORKSPACE/sideloadfix/SideloadFix.dylib"
 
-          test -f "$IPA"
-          test -f "$DEB"
-
           rm -rf "$GITHUB_WORKSPACE/inject-work"
           mkdir -p "$GITHUB_WORKSPACE/inject-work/app" "$GITHUB_WORKSPACE/inject-work/deb"
 
-          # Extract IPA
           unzip -q "$IPA" -d "$GITHUB_WORKSPACE/inject-work/app"
 
           APP="$(find "$GITHUB_WORKSPACE/inject-work/app/Payload" -maxdepth 1 -type d -name '*.app' | head -n 1)"
           test -n "$APP"
-
           PLIST="$APP/Info.plist"
           EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
           BIN="$APP/$EXECUTABLE_NAME"
           test -f "$BIN"
 
-          echo "App: $APP"
-          echo "Executable: $BIN"
-
-          # Extract DEB
           cd "$GITHUB_WORKSPACE/inject-work/deb"
           ar x "$DEB"
           DATA_TAR="$(find . -maxdepth 1 -type f -name 'data.tar.*' | head -n 1)"
@@ -118,63 +108,86 @@ jobs:
           test -f "$TG_DYLIB"
           test -d "$TG_BUNDLE"
 
-          # Copy tweak payload into jailed app
           mkdir -p "$APP/Frameworks"
-          cp "$TG_DYLIB" "$APP/Frameworks/TGExtra.dylib"
           cp "$SIDELOAD_FIX" "$APP/Frameworks/SideloadFix.dylib"
+          cp "$TG_DYLIB" "$APP/Frameworks/TGExtra.dylib"
+
           rm -rf "$APP/TGExtra.bundle"
           cp -R "$TG_BUNDLE" "$APP/TGExtra.bundle"
 
-          # Inject load commands into the MAIN Telegram executable only.
-          "$INSERT" --all-yes \
-            "@executable_path/Frameworks/TGExtra.dylib" \
-            "$BIN"
-          mv "${BIN}_patched" "$BIN"
-
+          # IMPORTANT:
+          # SideloadFix must be loaded BEFORE TGExtra so its path/bundle hooks
+          # exist before TGExtra constructors run.
           "$INSERT" --all-yes \
             "@executable_path/Frameworks/SideloadFix.dylib" \
             "$BIN"
           mv "${BIN}_patched" "$BIN"
 
-          # Visible application name.
+          "$INSERT" --all-yes \
+            "@executable_path/Frameworks/TGExtra.dylib" \
+            "$BIN"
+          mv "${BIN}_patched" "$BIN"
+
+          # Give dylibs relocatable install names. This is not strictly
+          # required for direct loading, but avoids absolute jailbreak-style
+          # install names surviving into a jailed sideload build.
+          install_name_tool -id "@rpath/SideloadFix.dylib" "$APP/Frameworks/SideloadFix.dylib" || true
+          install_name_tool -id "@rpath/TGExtra.dylib" "$APP/Frameworks/TGExtra.dylib" || true
+
           /usr/libexec/PlistBuddy -c "Set :CFBundleName Svinogram" "$PLIST" || \
             /usr/libexec/PlistBuddy -c "Add :CFBundleName string Svinogram" "$PLIST"
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Svinogram" "$PLIST" || \
             /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Svinogram" "$PLIST"
 
-          # Localized InfoPlist.strings may override CFBundleDisplayName.
-          find "$APP" -type f -name 'InfoPlist.strings' -print0 | while IFS= read -r -d '' F; do
-            plutil -replace CFBundleDisplayName -string "Svinogram" "$F" 2>/dev/null || true
-            plutil -replace CFBundleName -string "Svinogram" "$F" 2>/dev/null || true
-          done
-
-          # Remove old signatures; SideStore will perform the real Apple signing later.
+          # The final Apple signature will be applied by SideStore.
+          # Remove stale signatures from the three binaries we changed/added.
+          codesign --remove-signature "$BIN" 2>/dev/null || true
+          codesign --remove-signature "$APP/Frameworks/SideloadFix.dylib" 2>/dev/null || true
+          codesign --remove-signature "$APP/Frameworks/TGExtra.dylib" 2>/dev/null || true
           rm -rf "$APP/_CodeSignature"
-          find "$APP" -name 'embedded.mobileprovision' -delete
+          find "$APP" -name embedded.mobileprovision -delete
 
-          echo "=== Injection verification ==="
-          otool -L "$BIN" | grep -E 'TGExtra\.dylib|SideloadFix\.dylib'
+          echo "=== MAIN EXECUTABLE LOAD ORDER ==="
+          otool -L "$BIN" | grep -E 'SideloadFix|TGExtra'
+
+          # Enforce the correct order, not merely presence.
+          SIDE_LINE="$(otool -L "$BIN" | nl -ba | grep 'SideloadFix.dylib' | awk '{print $1}')"
+          TG_LINE="$(otool -L "$BIN" | nl -ba | grep 'TGExtra.dylib' | awk '{print $1}')"
+          test -n "$SIDE_LINE"
+          test -n "$TG_LINE"
+          test "$SIDE_LINE" -lt "$TG_LINE"
+
+          echo "=== TGExtra direct dylib dependencies ==="
+          otool -L "$APP/Frameworks/TGExtra.dylib"
+
+          # libroot-related strings can exist in the binary without being a
+          # dyld load dependency. Fail only if it is an actual LC_LOAD_DYLIB.
+          if otool -L "$APP/Frameworks/TGExtra.dylib" | grep -q 'libroot.dylib'; then
+            echo "ERROR: TGExtra has a real libroot dylib dependency."
+            exit 1
+          else
+            echo "OK: libroot.dylib is NOT a direct dyld dependency."
+          fi
+
+          test -f "$APP/TGExtra.bundle/langs.json"
           test -f "$APP/Frameworks/TGExtra.dylib"
           test -f "$APP/Frameworks/SideloadFix.dylib"
-          test -f "$APP/TGExtra.bundle/langs.json"
 
           echo "=== Architectures ==="
           lipo -info "$BIN"
-          lipo -info "$APP/Frameworks/TGExtra.dylib" || true
-          lipo -info "$APP/Frameworks/SideloadFix.dylib" || true
+          lipo -info "$APP/Frameworks/TGExtra.dylib"
+          lipo -info "$APP/Frameworks/SideloadFix.dylib"
 
-          # Repack as unsigned IPA for SideStore.
           cd "$GITHUB_WORKSPACE/inject-work/app"
-          rm -f "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa"
-          zip -qry "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa" Payload
+          rm -f "$GITHUB_WORKSPACE/Svinogram-11.12-v8-unsigned.ipa"
+          zip -qry "$GITHUB_WORKSPACE/Svinogram-11.12-v8-unsigned.ipa" Payload
+          unzip -tq "$GITHUB_WORKSPACE/Svinogram-11.12-v8-unsigned.ipa"
+          shasum -a 256 "$GITHUB_WORKSPACE/Svinogram-11.12-v8-unsigned.ipa"
 
-          unzip -tq "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa"
-          shasum -a 256 "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa"
-
-      - name: Upload injected IPA
+      - name: Upload fixed IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Svinogram-11.12-injected-unsigned
-          path: Svinogram-11.12-injected-unsigned.ipa
+          name: Svinogram-11.12-v8-unsigned
+          path: Svinogram-11.12-v8-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
