@@ -37,42 +37,68 @@ def patch_rules_apple_for_unsigned_device():
         print("rules_apple unsigned-device patch already applied")
         return
 
-    old = """    if not profile_artifact:
-        fail(
-            "\n".join([
-                "ERROR: In {}:".format(str(rule_label)),
-                "Building for device, but no provisioning_profile attribute was set.",
-            ]),
-        )
-"""
+    marker = "Building for device, but no provisioning_profile attribute was set."
+    if marker not in text:
+        raise SystemExit("Could not locate rules_apple provisioning guard")
 
-    new = """    # SVINOGRAM_UNSIGNED_DEVICE_PATCH
-    # This CI job creates an unsigned device IPA. Feather signs it afterwards.
+    marker_pos = text.index(marker)
+    start = text.rfind("    if not profile_artifact:", 0, marker_pos)
+    end_marker = "    # Create intermediate file with proper name for the binary."
+    end = text.find(end_marker, marker_pos)
+
+    if start < 0 or end < 0:
+        raise SystemExit("Could not safely patch provisioning_profile.bzl")
+
+    replacement = """    # SVINOGRAM_UNSIGNED_DEVICE_PATCH
+    # CI produces an unsigned arm64 device IPA; Feather signs it later.
     if not profile_artifact:
         return struct(
             bundle_files = [],
         )
+
 """
-
-    if old in text:
-        text = text.replace(old, new, 1)
-    else:
-        marker = "Building for device, but no provisioning_profile attribute was set."
-        if marker not in text:
-            raise SystemExit(
-                "Could not locate the rules_apple device provisioning guard; "
-                "the vendored rules changed."
-            )
-        marker_pos = text.index(marker)
-        start = text.rfind("    if not profile_artifact:", 0, marker_pos)
-        end_marker = "    # Create intermediate file with proper name for the binary."
-        end = text.find(end_marker, marker_pos)
-        if start < 0 or end < 0:
-            raise SystemExit("Could not safely patch provisioning_profile.bzl")
-        text = text[:start] + new + text[end:]
-
+    text = text[:start] + replacement + text[end:]
     path.write_text(text, encoding="utf-8")
     print("Patched:", path)
+
+def patch_yasm_cmake():
+    """
+    GitHub macOS runner has Homebrew CMake 4.x early in PATH.
+    Telegram 11.12's yasm genrule downloads CMake 3.23.1, but APPENDS it
+    to PATH, so CMake 4 wins and old yasm's cmake_minimum_required fails.
+
+    Force the bundled CMake to the FRONT of PATH.
+    """
+    path = ROOT / "third-party" / "yasm" / "BUILD"
+    if not path.exists():
+        raise SystemExit(f"yasm BUILD not found: {path}")
+
+    text = path.read_text(encoding="utf-8")
+    original = text
+
+    # Current Telegram 11.12 form.
+    text = text.replace(
+        'PATH="$$PATH:$$CMAKE_DIR/cmake-3.23.1-macos-universal/CMake.app/Contents/bin" cmake ..',
+        'PATH="$$CMAKE_DIR/cmake-3.23.1-macos-universal/CMake.app/Contents/bin:$$PATH" cmake ..'
+    )
+
+    # Fallback if whitespace/version layout differs slightly.
+    if text == original:
+        old = 'PATH="$$PATH:$$CMAKE_DIR/'
+        if old in text:
+            text = text.replace(old, 'PATH="$$CMAKE_DIR/', 1)
+            # Fix the tail so the existing PATH follows bundled CMake.
+            needle = '/CMake.app/Contents/bin" cmake ..'
+            repl = '/CMake.app/Contents/bin:$$PATH" cmake ..'
+            text = text.replace(needle, repl, 1)
+
+    if text == original:
+        raise SystemExit(
+            "Could not patch third-party/yasm/BUILD: expected CMake PATH command not found"
+        )
+
+    path.write_text(text, encoding="utf-8")
+    print("Patched yasm to prefer bundled CMake 3.23.1:", path)
 
 def make_configuration_repo(bazel_path: Path) -> Path:
     config_json = ROOT / "build-system" / "appstore-configuration.json"
@@ -121,6 +147,7 @@ def main():
         raise SystemExit(f'Expected Telegram 11.12, got {versions.get("app")!r}')
 
     patch_rules_apple_for_unsigned_device()
+    patch_yasm_cmake()
 
     bazel = Path(locate_bazel(str(ROOT), None)).resolve()
     run([bazel, "--version"])
@@ -129,6 +156,8 @@ def main():
 
     cache_dir = Path.home() / "telegram-bazel-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    home = os.environ.get("HOME", str(Path.home()))
 
     cmd = [
         bazel,
@@ -140,6 +169,17 @@ def main():
         "--verbose_failures",
         "--features=swift.skip_function_bodies_for_derived_files",
         "--features=disable_legacy_signing",
+
+        # Bazel genrules run with a deliberately small environment.
+        # Pass HOME so Homebrew-provided helper tools do not abort.
+        f"--action_env=HOME={home}",
+        f"--host_action_env=HOME={home}",
+
+        # Backup compatibility knob in case another old CMake project
+        # accidentally resolves to runner CMake 4.x.
+        "--action_env=CMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "--host_action_env=CMAKE_POLICY_VERSION_MINIMUM=3.5",
+
         f"--jobs={max(2, os.cpu_count() or 4)}",
         "--define=buildNumber=12001",
         "--define=telegramVersion=11.12",
