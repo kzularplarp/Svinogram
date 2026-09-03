@@ -1,4 +1,4 @@
-name: Build Telegram 11.12 unsigned
+name: Build Svinogram 11.12 injected
 
 on:
   workflow_dispatch:
@@ -8,9 +8,6 @@ permissions:
 
 jobs:
   build:
-    # macos-15 ARM currently has a GitHub runner image bug where ibtool can
-    # report "iOS 18.2 Platform Not Installed" even with Xcode 16.2 selected.
-    # macos-14 ARM has Xcode 16.2 + iOS 18.2 installed and avoids that bug.
     runs-on: macos-14
     timeout-minutes: 360
 
@@ -24,62 +21,160 @@ jobs:
           set -euxo pipefail
           sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
           xcodebuild -version
-          sw_vers
-          uname -m
-
-          echo "=== SDK check ==="
-          xcodebuild -showsdks
           xcrun --sdk iphoneos --show-sdk-version
-          xcrun --sdk iphoneos --show-sdk-path
           test "$(xcrun --sdk iphoneos --show-sdk-version)" = "18.2"
+
+      - name: Check required files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f build_unsigned.py
+          test -f Svinogram_1.2.1_iphoneos-arm.deb
+          shasum -a 256 Svinogram_1.2.1_iphoneos-arm.deb
 
       - name: Clone official Telegram-iOS 11.12
         shell: bash
         run: |
           set -euxo pipefail
-          git clone             --branch release-11.12             --depth 1             --recurse-submodules             --shallow-submodules             https://github.com/TelegramMessenger/Telegram-iOS.git Telegram-iOS
+          git clone \
+            --branch release-11.12 \
+            --depth 1 \
+            --recurse-submodules \
+            --shallow-submodules \
+            https://github.com/TelegramMessenger/Telegram-iOS.git Telegram-iOS
           cd Telegram-iOS
           git rev-parse HEAD
           cat versions.json
 
-      - name: Build unsigned arm64 IPA
+      - name: Build unsigned Telegram 11.12
         shell: bash
         run: |
           set -euxo pipefail
-          test -f build_unsigned.py
           cp build_unsigned.py Telegram-iOS/build_unsigned.py
           cd Telegram-iOS
           python3 build_unsigned.py
 
-      - name: Inspect result
+      - name: Build insert_dylib
         shell: bash
         run: |
           set -euxo pipefail
-          IPA="Telegram-iOS/out/Telegram-11.12-unsigned.ipa"
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib.git
+          cc insert_dylib/insert_dylib/main.c -o insert_dylib_bin
+          ./insert_dylib_bin --help >/dev/null 2>&1 || true
+
+      - name: Download SideloadFix
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p sideloadfix
+          gh release download release \
+            --repo waruhachi/SideloadFix \
+            --pattern 'SideloadFix.dylib' \
+            --dir sideloadfix
+          test -f sideloadfix/SideloadFix.dylib
+          shasum -a 256 sideloadfix/SideloadFix.dylib
+
+      - name: Inject Svinogram tweak
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          IPA="$GITHUB_WORKSPACE/Telegram-iOS/out/Telegram-11.12-unsigned.ipa"
+          DEB="$GITHUB_WORKSPACE/Svinogram_1.2.1_iphoneos-arm.deb"
+          INSERT="$GITHUB_WORKSPACE/insert_dylib_bin"
+          SIDELOAD_FIX="$GITHUB_WORKSPACE/sideloadfix/SideloadFix.dylib"
+
           test -f "$IPA"
-          shasum -a 256 "$IPA"
+          test -f "$DEB"
 
-          rm -rf /tmp/tgipa
-          mkdir -p /tmp/tgipa
-          unzip -q "$IPA" -d /tmp/tgipa
+          rm -rf "$GITHUB_WORKSPACE/inject-work"
+          mkdir -p "$GITHUB_WORKSPACE/inject-work/app" "$GITHUB_WORKSPACE/inject-work/deb"
 
-          APP="$(find /tmp/tgipa/Payload -maxdepth 1 -type d -name '*.app' | head -1)"
+          # Extract IPA
+          unzip -q "$IPA" -d "$GITHUB_WORKSPACE/inject-work/app"
+
+          APP="$(find "$GITHUB_WORKSPACE/inject-work/app/Payload" -maxdepth 1 -type d -name '*.app' | head -n 1)"
           test -n "$APP"
 
-          echo "=== App info ==="
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          PLIST="$APP/Info.plist"
+          EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
+          BIN="$APP/$EXECUTABLE_NAME"
+          test -f "$BIN"
 
-          BIN_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
-          file "$APP/$BIN_NAME"
+          echo "App: $APP"
+          echo "Executable: $BIN"
 
-          echo "=== Code signature ==="
-          codesign -dv "$APP" 2>&1 || true
+          # Extract DEB
+          cd "$GITHUB_WORKSPACE/inject-work/deb"
+          ar x "$DEB"
+          DATA_TAR="$(find . -maxdepth 1 -type f -name 'data.tar.*' | head -n 1)"
+          test -n "$DATA_TAR"
+          tar -xf "$DATA_TAR"
 
-      - name: Upload Telegram IPA
+          TG_DYLIB="$(find . -type f -name 'TGExtra.dylib' | head -n 1)"
+          TG_BUNDLE="$(find . -type d -name 'TGExtra.bundle' | head -n 1)"
+          test -f "$TG_DYLIB"
+          test -d "$TG_BUNDLE"
+
+          # Copy tweak payload into jailed app
+          mkdir -p "$APP/Frameworks"
+          cp "$TG_DYLIB" "$APP/Frameworks/TGExtra.dylib"
+          cp "$SIDELOAD_FIX" "$APP/Frameworks/SideloadFix.dylib"
+          rm -rf "$APP/TGExtra.bundle"
+          cp -R "$TG_BUNDLE" "$APP/TGExtra.bundle"
+
+          # Inject load commands into the MAIN Telegram executable only.
+          "$INSERT" --all-yes \
+            "@executable_path/Frameworks/TGExtra.dylib" \
+            "$BIN"
+          mv "${BIN}_patched" "$BIN"
+
+          "$INSERT" --all-yes \
+            "@executable_path/Frameworks/SideloadFix.dylib" \
+            "$BIN"
+          mv "${BIN}_patched" "$BIN"
+
+          # Visible application name.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Svinogram" "$PLIST" || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleName string Svinogram" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Svinogram" "$PLIST" || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Svinogram" "$PLIST"
+
+          # Localized InfoPlist.strings may override CFBundleDisplayName.
+          find "$APP" -type f -name 'InfoPlist.strings' -print0 | while IFS= read -r -d '' F; do
+            plutil -replace CFBundleDisplayName -string "Svinogram" "$F" 2>/dev/null || true
+            plutil -replace CFBundleName -string "Svinogram" "$F" 2>/dev/null || true
+          done
+
+          # Remove old signatures; SideStore will perform the real Apple signing later.
+          rm -rf "$APP/_CodeSignature"
+          find "$APP" -name 'embedded.mobileprovision' -delete
+
+          echo "=== Injection verification ==="
+          otool -L "$BIN" | grep -E 'TGExtra\.dylib|SideloadFix\.dylib'
+          test -f "$APP/Frameworks/TGExtra.dylib"
+          test -f "$APP/Frameworks/SideloadFix.dylib"
+          test -f "$APP/TGExtra.bundle/langs.json"
+
+          echo "=== Architectures ==="
+          lipo -info "$BIN"
+          lipo -info "$APP/Frameworks/TGExtra.dylib" || true
+          lipo -info "$APP/Frameworks/SideloadFix.dylib" || true
+
+          # Repack as unsigned IPA for SideStore.
+          cd "$GITHUB_WORKSPACE/inject-work/app"
+          rm -f "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa"
+          zip -qry "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa" Payload
+
+          unzip -tq "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa"
+          shasum -a 256 "$GITHUB_WORKSPACE/Svinogram-11.12-injected-unsigned.ipa"
+
+      - name: Upload injected IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-11.12-unsigned
-          path: Telegram-iOS/out/Telegram-11.12-unsigned.ipa
+          name: Svinogram-11.12-injected-unsigned
+          path: Svinogram-11.12-injected-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
