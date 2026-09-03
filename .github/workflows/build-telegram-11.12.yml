@@ -8,7 +8,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macos-15 ARM currently has a GitHub runner image bug where ibtool can
+    # report "iOS 18.2 Platform Not Installed" even with Xcode 16.2 selected.
+    # macos-14 ARM has Xcode 16.2 + iOS 18.2 installed and avoids that bug.
+    runs-on: macos-14
     timeout-minutes: 360
 
     steps:
@@ -23,6 +26,12 @@ jobs:
           xcodebuild -version
           sw_vers
           uname -m
+
+          echo "=== SDK check ==="
+          xcodebuild -showsdks
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = "18.2"
 
       - name: Clone official Telegram-iOS 11.12
         shell: bash
@@ -49,7 +58,6 @@ jobs:
           IPA="Telegram-iOS/out/Telegram-11.12-unsigned.ipa"
           test -f "$IPA"
           shasum -a 256 "$IPA"
-          unzip -l "$IPA" | head -80
 
           rm -rf /tmp/tgipa
           mkdir -p /tmp/tgipa
@@ -58,11 +66,15 @@ jobs:
           APP="$(find /tmp/tgipa/Payload -maxdepth 1 -type d -name '*.app' | head -1)"
           test -n "$APP"
 
+          echo "=== App info ==="
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
 
           BIN_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
           file "$APP/$BIN_NAME"
+
+          echo "=== Code signature ==="
+          codesign -dv "$APP" 2>&1 || true
 
       - name: Upload Telegram IPA
         uses: actions/upload-artifact@v4
