@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-Build Telegram-iOS release-11.12 as an unsigned arm64 IPA for personal
-sideload testing.
-
-No third-party IPA is downloaded.
-"""
-
 from pathlib import Path
 import glob
 import json
@@ -18,7 +11,7 @@ ROOT = Path(__file__).resolve().parent
 MAKE_DIR = ROOT / "build-system" / "Make"
 sys.path.insert(0, str(MAKE_DIR))
 
-from BazelLocation import locate_bazel  # type: ignore
+from BazelLocation import locate_bazel
 
 def run(cmd, **kwargs):
     print("+", " ".join(str(x) for x in cmd), flush=True)
@@ -66,22 +59,14 @@ def main():
     os.chdir(ROOT)
 
     versions = json.loads((ROOT / "versions.json").read_text(encoding="utf-8"))
-    if versions.get("app") != "11.12":
-        raise SystemExit(f'Expected Telegram 11.12, got {versions.get("app")!r}')
+    print("Telegram versions.json:", versions)
 
-    # Telegram's own helper downloads the exact Bazel binary declared in
-    # versions.json and verifies its SHA-256.
     bazel = Path(locate_bazel(str(ROOT), None)).resolve()
-    print("Bazel:", bazel)
     run([bazel, "--version"])
 
     config_repo = make_configuration_repo(bazel)
-
     cache_dir = Path.home() / "telegram-bazel-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-
-    jobs = str(max(2, os.cpu_count() or 4))
-    build_number = "12001"
 
     cmd = [
         bazel,
@@ -92,8 +77,8 @@ def main():
         "--features=swift.use_global_module_cache",
         "--verbose_failures",
         "--features=swift.skip_function_bodies_for_derived_files",
-        f"--jobs={jobs}",
-        f"--define=buildNumber={build_number}",
+        f"--jobs={max(2, os.cpu_count() or 4)}",
+        "--define=buildNumber=12001",
         "--define=telegramVersion=11.12",
         f"--disk_cache={cache_dir}",
         "-c", "opt",
@@ -116,29 +101,18 @@ def main():
     ):
         candidates.extend(glob.glob(pattern, recursive=True))
 
-    seen = set()
-    unique = []
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-    candidates = unique
-
     if not candidates:
         raise SystemExit("Build succeeded but Telegram.ipa could not be found.")
 
     ipa = Path(candidates[0]).resolve()
-    print("Found IPA:", ipa)
-
     out_dir = ROOT / "out"
     out_dir.mkdir(exist_ok=True)
     dst = out_dir / "Telegram-11.12-unsigned.ipa"
     shutil.copy2(ipa, dst)
 
     run(["unzip", "-tq", dst])
-
-    print("\nDONE:", dst)
     run(["shasum", "-a", "256", dst])
+    print("DONE:", dst)
 
 if __name__ == "__main__":
     main()
