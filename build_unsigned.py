@@ -3,6 +3,7 @@ from pathlib import Path
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -100,6 +101,49 @@ def patch_yasm_cmake():
     path.write_text(text, encoding="utf-8")
     print("Patched yasm to prefer bundled CMake 3.23.1:", path)
 
+def patch_runtime_for_sideload():
+    """
+    Telegram's App Store build enables iCloud/CloudKit paths that require
+    Apple-only entitlements. A free SideStore profile does not contain those
+    CloudKit entitlements. On iOS 26 this can trap inside CKContainer at launch.
+
+    Force explicit runtime NetworkInitializationArguments flags to false.
+    The build configuration below also removes iCloud/Siri/push entitlements.
+    """
+    patched = []
+    pattern = re.compile(r"\bisICloudEnabled\s*:\s*true\b")
+
+    # Search project sources, but skip generated/bazel output trees.
+    roots = [
+        ROOT / "Telegram",
+        ROOT / "submodules",
+    ]
+
+    for source_root in roots:
+        if not source_root.exists():
+            continue
+        for path in source_root.rglob("*.swift"):
+            parts = set(path.parts)
+            if "bazel-out" in parts or "build-input" in parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            new_text, count = pattern.subn("isICloudEnabled: false", text)
+            if count:
+                path.write_text(new_text, encoding="utf-8")
+                patched.append((path, count))
+
+    print("CloudKit runtime patches:", flush=True)
+    if patched:
+        for path, count in patched:
+            print(f"  {path}: {count}", flush=True)
+    else:
+        print("  No literal 'isICloudEnabled: true' occurrences found.", flush=True)
+        print("  Build-time telegram_enable_icloud=False is still applied.", flush=True)
+
 def make_configuration_repo(bazel_path: Path) -> Path:
     config_json = ROOT / "build-system" / "appstore-configuration.json"
     data = json.loads(config_json.read_text(encoding="utf-8"))
@@ -129,10 +173,12 @@ def make_configuration_repo(bazel_path: Path) -> Path:
         f'telegram_appstore_id = "{data["appstore_id"]}"',
         f'telegram_app_specific_url_scheme = "{data["app_specific_url_scheme"]}"',
         f'telegram_premium_iap_product_id = "{data["premium_iap_product_id"]}"',
-        'telegram_aps_environment = "development"',
-        f'telegram_enable_siri = {bool(data["enable_siri"])}',
-        f'telegram_enable_icloud = {bool(data["enable_icloud"])}',
-        'telegram_enable_watch = True',
+        # Sideload-safe capability set. Free Apple IDs / SideStore profiles
+        # do not provide Telegram's App Store CloudKit/Siri/push entitlements.
+        'telegram_aps_environment = ""',
+        'telegram_enable_siri = False',
+        'telegram_enable_icloud = False',
+        'telegram_enable_watch = False',
         '',
     ]
     (repo / "variables.bzl").write_text("\n".join(lines), encoding="utf-8")
@@ -148,6 +194,7 @@ def main():
 
     patch_rules_apple_for_unsigned_device()
     patch_yasm_cmake()
+    patch_runtime_for_sideload()
 
     bazel = Path(locate_bazel(str(ROOT), None)).resolve()
     run([bazel, "--version"])
