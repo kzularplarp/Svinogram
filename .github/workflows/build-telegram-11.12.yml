@@ -12,6 +12,9 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout builder files
+        uses: actions/checkout@v4
+
       - name: Select Xcode 16.2
         shell: bash
         run: |
@@ -25,12 +28,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          git clone \
-            --branch release-11.12 \
-            --depth 1 \
-            --recurse-submodules \
-            --shallow-submodules \
-            https://github.com/TelegramMessenger/Telegram-iOS.git Telegram-iOS
+          git clone             --branch release-11.12             --depth 1             --recurse-submodules             --shallow-submodules             https://github.com/TelegramMessenger/Telegram-iOS.git Telegram-iOS
           cd Telegram-iOS
           git rev-parse HEAD
           cat versions.json
@@ -39,6 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          test -f build_unsigned.py
           cp build_unsigned.py Telegram-iOS/build_unsigned.py
           cd Telegram-iOS
           python3 build_unsigned.py
