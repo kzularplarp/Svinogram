@@ -1,0 +1,74 @@
+name: Build Telegram 11.12 unsigned
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Select Xcode 16.2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+          xcodebuild -version
+          sw_vers
+          uname -m
+
+      - name: Clone official Telegram-iOS 11.12
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone \
+            --branch release-11.12 \
+            --depth 1 \
+            --recurse-submodules \
+            --shallow-submodules \
+            https://github.com/TelegramMessenger/Telegram-iOS.git Telegram-iOS
+          cd Telegram-iOS
+          git rev-parse HEAD
+          cat versions.json
+
+      - name: Build unsigned arm64 IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp build_unsigned.py Telegram-iOS/build_unsigned.py
+          cd Telegram-iOS
+          python3 build_unsigned.py
+
+      - name: Inspect result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          IPA="Telegram-iOS/out/Telegram-11.12-unsigned.ipa"
+          test -f "$IPA"
+          shasum -a 256 "$IPA"
+          unzip -l "$IPA" | head -80
+
+          rm -rf /tmp/tgipa
+          mkdir -p /tmp/tgipa
+          unzip -q "$IPA" -d /tmp/tgipa
+
+          APP="$(find /tmp/tgipa/Payload -maxdepth 1 -type d -name '*.app' | head -1)"
+          test -n "$APP"
+
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+
+          BIN_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          file "$APP/$BIN_NAME"
+
+      - name: Upload Telegram IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-11.12-unsigned
+          path: Telegram-iOS/out/Telegram-11.12-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
